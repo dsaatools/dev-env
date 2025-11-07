@@ -31,8 +31,8 @@ No VM guests are running outdated hypervisor (qemu) binaries on this
  host.
 root@dsaa:/home/dsaa#
 
-
-install tmux
+apt install htop
+apt install tmux
 curl -fsSL https://bun.sh/install | bash
 source /root/.bashrc
 apt install nodejs
@@ -70,3 +70,26 @@ root@dsaa:/home/dsaa# echo 'export PATH=/root/.local/bin:$PATH' >> ~/.bashrc
   source ~/.bashrc
 root@dsaa:/home/dsaa#
 export FACTORY_API_KEY=******
+
+Just add the custom_models in the ~/.factory/config.json
+
+In our case, the custom_models should look like this
+
+{
+  "custom_models": [
+    {
+      "model_display_name": "GLM 4.6 Coding Plan",
+      "model": "glm-4.6",
+      "base_url": "https://api.z.ai/api/anthropic",
+      "api_key": "YOUR_ZAI_API_KEY",
+      "provider": "zai"
+    }
+  ]
+}
+Once you’ve added the config, you can now use the /model command in the droid CLI to select that model.
+
+
+
+root@dsaa:/home/dsaa# mkdir code
+root@dsaa:/home/dsaa# cd code
+root@dsaa:/home/dsaa/code#
