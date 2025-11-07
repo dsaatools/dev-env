@@ -30,7 +30,7 @@ check_env() {
     for var in "${required[@]}"; do
         [[ -z "${!var:-}" ]] && error "$var is required. Set it in .env or export before running."
     done
-    
+
     # Optional multiple tokens
     if [[ -n "${GITHUB_TOKENS:-}" ]]; then
         IFS=',' read -ra TOKENS <<< "$GITHUB_TOKENS"
@@ -44,18 +44,18 @@ install_packages() {
         log "Skipping system package installation (not running as root)"
         return
     fi
-    
+
     log "Checking system packages..."
     export DEBIAN_FRONTEND=noninteractive
-    
+
     # Update package lists only if needed
     if [[ $(find /var/lib/apt/lists -mtime -1 | wc -l) -eq 0 ]]; then
         log "Updating package lists..."
         apt-get update -qq
     fi
-    
+
     # Check and install packages one by one without version pinning
-    local packages=("curl" "unzip" "htop" "tmux" "nodejs" "git")
+    local packages=("curl" "unzip" "htop" "tmux" "nodejs" "git" "jq") # Added jq for configure_factory
     for package in "${packages[@]}"; do
         if ! dpkg -l | grep -q "^ii  $package "; then
             log "Installing $package..."
@@ -70,17 +70,19 @@ install_packages() {
 install_bun() {
     # Run as the real user, not root
     if [[ "$SYSTEM_INSTALL" == true ]]; then
-        log "Installing bun for user $REAL_USER..."
-        sudo -u "$REAL_USER" bash -c "
+        sudo -u "$REAL_USER" bash -c "$(declare -f log warn error);
             export HOME=\"$REAL_HOME\"
+            log \"Installing bun for user $REAL_USER...\"
             if ! command -v bun &> /dev/null; then
                 curl -fsSL https://bun.sh/install | bash
                 export BUN_INSTALL=\"$REAL_HOME/.bun\"
                 export PATH=\"$BUN_INSTALL/bin:\$PATH\"
-                
+
                 # Add to bashrc if not already there
-                if ! grep -q 'export BUN_INSTALL=\"$REAL_HOME/.bun\"' \"$REAL_HOME/.bashrc\"; then
-                    echo 'export BUN_INSTALL=\"$REAL_HOME/.bun\"' >> \"$REAL_HOME/.bashrc\"
+                if ! grep -q 'export BUN_INSTALL=\"$HOME/.bun\"' \"$REAL_HOME/.bashrc\"; then
+                    echo '' >> \"$REAL_HOME/.bashrc\"
+                    echo '# Bun JS Runtime' >> \"$REAL_HOME/.bashrc\"
+                    echo 'export BUN_INSTALL=\"$HOME/.bun\"' >> \"$REAL_HOME/.bashrc\"
                     echo 'export PATH=\"$BUN_INSTALL/bin:\$PATH\"' >> \"$REAL_HOME/.bashrc\"
                 fi
             else
@@ -94,14 +96,16 @@ install_bun() {
             curl -fsSL https://bun.sh/install | bash
             export BUN_INSTALL="$HOME/.bun"
             export PATH="$BUN_INSTALL/bin:$PATH"
-            
-            # Add to bashrc if not already there
+
             if ! grep -q 'export BUN_INSTALL="$HOME/.bun"' ~/.bashrc; then
+                echo '' >> ~/.bashrc
+                echo '# Bun JS Runtime' >> ~/.bashrc
                 echo 'export BUN_INSTALL="$HOME/.bun"' >> ~/.bashrc
                 echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> ~/.bashrc
             fi
         else
-            local bun_version=$(bun --version)
+            local bun_version
+            bun_version=$(bun --version)
             log "bun already installed (version $bun_version)"
         fi
     fi
@@ -111,9 +115,10 @@ install_bun() {
 install_claude() {
     # Run as the real user, not root
     if [[ "$SYSTEM_INSTALL" == true ]]; then
-        sudo -u "$REAL_USER" bash -c "
+        sudo -u "$REAL_USER" bash -c "$(declare -f log warn error);
             export HOME=\"$REAL_HOME\"
             export PATH=\"$REAL_HOME/.bun/bin:\$PATH\"
+            log \"Checking claude-code installation for user $REAL_USER...\"
             if ! bun pm ls -g | grep -q \"@anthropic-ai/claude-code\"; then
                 log \"Installing claude-code...\"
                 bun install -g @anthropic-ai/claude-code
@@ -127,7 +132,8 @@ install_claude() {
             log "Installing claude-code..."
             bun install -g @anthropic-ai/claude-code
         else
-            local claude_version=$(bun pm ls -g @anthropic-ai/claude-code | grep -o '@[0-9.]*' | head -1)
+            local claude_version
+            claude_version=$(bun pm ls -g @anthropic-ai/claude-code | grep -o '@[0-9.]*' | head -1)
             log "claude-code already installed (version ${claude_version#@})"
         fi
     fi
@@ -137,9 +143,9 @@ install_claude() {
 setup_git() {
     # Run as the real user, not root
     if [[ "$SYSTEM_INSTALL" == true ]]; then
-        sudo -u "$REAL_USER" bash -c "
+        sudo -u "$REAL_USER" bash -c "$(declare -f log warn error);
             export HOME=\"$REAL_HOME\"
-            log \"Checking git configuration...\"
+            log \"Checking git configuration for user $REAL_USER...\"
             
             current_name=\$(git config --global user.name || echo \"\")
             current_email=\$(git config --global user.email || echo \"\")
@@ -179,10 +185,14 @@ setup_git() {
     else
         log "Checking git configuration..."
         
-        local current_name=$(git config --global user.name || echo "")
-        local current_email=$(git config --global user.email || echo "")
-        local current_default_branch=$(git config --global init.defaultBranch || echo "")
-        local current_pull_rebase=$(git config --global pull.rebase || echo "")
+        local current_name
+        current_name=$(git config --global user.name || echo "")
+        local current_email
+        current_email=$(git config --global user.email || echo "")
+        local current_default_branch
+        current_default_branch=$(git config --global init.defaultBranch || echo "")
+        local current_pull_rebase
+        current_pull_rebase=$(git config --global pull.rebase || echo "")
         
         if [[ "$current_name" != "$GIT_USER_NAME" ]]; then
             log "Setting git user.name to $GIT_USER_NAME"
@@ -223,21 +233,23 @@ setup_gh() {
         if ! command -v gh &> /dev/null; then
             log "Installing GitHub CLI..."
             curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            chmod 644 /usr/share/keyrings/githubcli-archive-keyring.gpg
             echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
             apt-get update -qq
             apt-get install -y gh
         else
-            local gh_version=$(gh --version | cut -d' ' -f3)
+            local gh_version
+            gh_version=$(gh --version | cut -d' ' -f3)
             log "GitHub CLI already installed (version $gh_version)"
         fi
         
         # Configure as the real user
-        sudo -u "$REAL_USER" bash -c "
+        sudo -u "$REAL_USER" bash -c "$(declare -f log warn error);
             export HOME=\"$REAL_HOME\"
             export GITHUB_TOKEN=\"$GITHUB_TOKEN\"
             export GITHUB_TOKENS=\"$GITHUB_TOKENS\"
             
-            # Check authentication
+            log \"Configuring GitHub CLI for user $REAL_USER...\"
             if ! gh auth status &> /dev/null; then
                 log \"Authenticating with primary GitHub account...\"
                 echo \"\$GITHUB_TOKEN\" | gh auth login --with-token --hostname github.com
@@ -246,7 +258,6 @@ setup_gh() {
                 log \"Already authenticated with GitHub\"
             fi
             
-            # Store additional tokens for later use
             if [[ -n \"\${GITHUB_TOKENS:-}\" ]]; then
                 mkdir -p \"$REAL_HOME/.config/gh/tokens\"
                 IFS=',' read -ra TOKENS <<< \"\$GITHUB_TOKENS\"
@@ -263,34 +274,34 @@ setup_gh() {
                     fi
                 done
                 
-                # Add helper functions to bashrc if not already there
-                if ! grep -q \"gh-switch()\" \"$REAL_HOME/.bashrc\"; then
+                if ! grep -q \"# GitHub account switcher\" \"$REAL_HOME/.bashrc\"; then
                     cat >> \"$REAL_HOME/.bashrc\" << 'EOF'
 
 # GitHub account switcher
 gh-switch() {
     local account_num=${1:-1}
     if [[ $account_num -eq 1 ]]; then
-        echo \"$GITHUB_TOKEN\" | gh auth login --with-token --hostname github.com
-        echo \"Switched to primary GitHub account\"
-    elif [[ -f \"$REAL_HOME/.config/gh/tokens/token_\$account_num\" ]]; then
-        local token=\$(cat \"$REAL_HOME/.config/gh/tokens/token_\$account_num\")
-        echo \"\$token\" | gh auth login --with-token --hostname github.com
-        echo \"Switched to GitHub account \$account_num\"
+        echo "$GITHUB_TOKEN" | gh auth login --with-token --hostname github.com
+        echo "Switched to primary GitHub account"
+    elif [[ -f "$HOME/.config/gh/tokens/token_$account_num" ]]; then
+        local token
+        token=$(cat "$HOME/.config/gh/tokens/token_$account_num")
+        echo "$token" | gh auth login --with-token --hostname github.com
+        echo "Switched to GitHub account $account_num"
     else
-        echo \"Token for account \$account_num not found\"
+        echo "Token for account $account_num not found"
         return 1
     fi
 }
 
-# List available GitHub accounts
 gh-list() {
-    echo \"Available GitHub accounts:\"
-    echo \"1: Primary\"
-    for token_file in \"$REAL_HOME\"/.config/gh/tokens/token_*; do
-        if [[ -f \"\$token_file\" ]]; then
-            local num=\$(basename \"\$token_file\" | cut -d'_' -f2)
-            echo \"\$num: Additional\"
+    echo "Available GitHub accounts:"
+    echo "1: Primary"
+    for token_file in "$HOME"/.config/gh/tokens/token_*; do
+        if [[ -f "$token_file" ]]; then
+            local num
+            num=$(basename "$token_file" | cut -d'_' -f2)
+            echo "$num: Additional"
         fi
     done
 }
@@ -305,11 +316,10 @@ EOF
         log "Checking GitHub CLI setup..."
         
         if ! command -v gh &> /dev/null; then
-            log "GitHub CLI not found. Please run this script with sudo to install it."
+            warn "GitHub CLI not found. Please run this script with sudo to install it."
             return
         fi
         
-        # Check authentication
         if ! gh auth status &> /dev/null; then
             log "Authenticating with primary GitHub account..."
             echo "$GITHUB_TOKEN" | gh auth login --with-token --hostname github.com
@@ -318,7 +328,6 @@ EOF
             log "Already authenticated with GitHub"
         fi
         
-        # Store additional tokens for later use
         if [[ -n "${GITHUB_TOKENS:-}" ]]; then
             mkdir -p ~/.config/gh/tokens
             IFS=',' read -ra TOKENS <<< "$GITHUB_TOKENS"
@@ -335,8 +344,7 @@ EOF
                 fi
             done
             
-            # Add helper functions to bashrc if not already there
-            if ! grep -q "gh-switch()" ~/.bashrc; then
+            if ! grep -q "# GitHub account switcher" ~/.bashrc; then
                 cat >> ~/.bashrc << 'EOF'
 
 # GitHub account switcher
@@ -346,7 +354,8 @@ gh-switch() {
         echo "$GITHUB_TOKEN" | gh auth login --with-token --hostname github.com
         echo "Switched to primary GitHub account"
     elif [[ -f "$HOME/.config/gh/tokens/token_$account_num" ]]; then
-        local token=$(cat "$HOME/.config/gh/tokens/token_$account_num")
+        local token
+        token=$(cat "$HOME/.config/gh/tokens/token_$account_num")
         echo "$token" | gh auth login --with-token --hostname github.com
         echo "Switched to GitHub account $account_num"
     else
@@ -355,13 +364,13 @@ gh-switch() {
     fi
 }
 
-# List available GitHub accounts
 gh-list() {
     echo "Available GitHub accounts:"
     echo "1: Primary"
     for token_file in "$HOME"/.config/gh/tokens/token_*; do
         if [[ -f "$token_file" ]]; then
-            local num=$(basename "$token_file" | cut -d'_' -f2)
+            local num
+            num=$(basename "$token_file" | cut -d'_' -f2)
             echo "$num: Additional"
         fi
     done
@@ -377,17 +386,18 @@ EOF
 
 # Install Factory CLI
 install_factory() {
-    # Run as the real user, not root
     if [[ "$SYSTEM_INSTALL" == true ]]; then
-        sudo -u "$REAL_USER" bash -c "
+        sudo -u "$REAL_USER" bash -c "$(declare -f log warn error);
             export HOME=\"$REAL_HOME\"
+            log \"Checking Factory CLI for user $REAL_USER...\"
             if ! command -v factory &> /dev/null; then
                 log \"Installing Factory CLI...\"
                 curl -fsSL https://app.factory.ai/cli | sh
                 
-                # Add to PATH if not already there
-                if ! grep -q 'export PATH=\"$REAL_HOME/.local/bin:\$PATH\"' \"$REAL_HOME/.bashrc\"; then
-                    echo 'export PATH=\"$REAL_HOME/.local/bin:\$PATH\"' >> \"$REAL_HOME/.bashrc\"
+                if ! grep -q 'export PATH=\"$HOME/.local/bin:\$PATH\"' \"$REAL_HOME/.bashrc\"; then
+                    echo '' >> \"$REAL_HOME/.bashrc\"
+                    echo '# Factory CLI' >> \"$REAL_HOME/.bashrc\"
+                    echo 'export PATH=\"$HOME/.local/bin:\$PATH\"' >> \"$REAL_HOME/.bashrc\"
                 fi
             else
                 log \"Factory CLI already installed\"
@@ -395,20 +405,20 @@ install_factory() {
         "
     else
         log "Checking Factory CLI installation..."
-        
         if ! command -v factory &> /dev/null; then
             log "Installing Factory CLI..."
             curl -fsSL https://app.factory.ai/cli | sh
             
-            # Add to PATH if not already there
             if ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' ~/.bashrc; then
+                echo '' >> ~/.bashrc
+                echo '# Factory CLI' >> ~/.bashrc
                 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
             fi
             
-            # Update PATH for current session
             export PATH="$HOME/.local/bin:$PATH"
         else
-            local factory_version=$(factory --version 2>/dev/null | cut -d' ' -f2 || echo "unknown")
+            local factory_version
+            factory_version=$(factory --version 2>/dev/null | cut -d' ' -f2 || echo "unknown")
             log "Factory CLI already installed (version $factory_version)"
         fi
     fi
@@ -416,40 +426,32 @@ install_factory() {
 
 # Configure Factory
 configure_factory() {
-    # Run as the real user, not root
     if [[ "$SYSTEM_INSTALL" == true ]]; then
-        sudo -u "$REAL_USER" bash -c "
+        sudo -u "$REAL_USER" bash -c "$(declare -f log warn error);
             export HOME=\"$REAL_HOME\"
             export FACTORY_API_KEY=\"$FACTORY_API_KEY\"
             export ZAI_API_KEY=\"$ZAI_API_KEY\"
             
-            log \"Checking Factory configuration...\"
+            log \"Checking Factory configuration for user $REAL_USER...\"
             config_dir=\"$REAL_HOME/.factory\"
             config_file=\"\$config_dir/config.json\"
             
             mkdir -p \"\$config_dir\"
             
-            # Check if config exists and has the correct API key
             if [[ -f \"\$config_file\" ]]; then
                 current_api_key=\$(jq -r '.api_key' \"\$config_file\" 2>/dev/null || echo \"\")
                 
                 if [[ \"\$current_api_key\" != \"\$FACTORY_API_KEY\" ]]; then
                     log \"Updating Factory API key...\"
-                    # Backup existing config
-                    cp \"\$config_file\" \"\$config_file.bak\"
-                    
-                    # Update API key while preserving other settings
                     jq --arg api_key \"\$FACTORY_API_KEY\" '.api_key = \$api_key' \"\$config_file\" > \"\$config_file.tmp\" && mv \"\$config_file.tmp\" \"\$config_file\"
                 else
                     log \"Factory API key already configured\"
                 fi
                 
-                # Check if custom model exists
                 has_glm_model=\$(jq -r '.custom_models[]? | select(.model == \"glm-4.6\") | .model' \"\$config_file\" 2>/dev/null || echo \"\")
                 
                 if [[ -z \"\$has_glm_model\" ]]; then
                     log \"Adding GLM model to Factory configuration...\"
-                    # Add GLM model to existing config
                     jq --arg api_key \"\$ZAI_API_KEY\" '.custom_models += [{
                         \"model_display_name\": \"GLM 4.6 Coding Plan\",
                         \"model\": \"glm-4.6\",
@@ -485,27 +487,22 @@ EOF
         
         mkdir -p "$config_dir"
         
-        # Check if config exists and has the correct API key
         if [[ -f "$config_file" ]]; then
-            local current_api_key=$(jq -r '.api_key' "$config_file" 2>/dev/null || echo "")
+            local current_api_key
+            current_api_key=$(jq -r '.api_key' "$config_file" 2>/dev/null || echo "")
             
             if [[ "$current_api_key" != "$FACTORY_API_KEY" ]]; then
                 log "Updating Factory API key..."
-                # Backup existing config
-                cp "$config_file" "$config_file.bak"
-                
-                # Update API key while preserving other settings
                 jq --arg api_key "$FACTORY_API_KEY" '.api_key = $api_key' "$config_file" > "$config_file.tmp" && mv "$config_file.tmp" "$config_file"
             else
                 log "Factory API key already configured"
             fi
             
-            # Check if custom model exists
-            local has_glm_model=$(jq -r '.custom_models[]? | select(.model == "glm-4.6") | .model' "$config_file" 2>/dev/null || echo "")
+            local has_glm_model
+            has_glm_model=$(jq -r '.custom_models[]? | select(.model == "glm-4.6") | .model' "$config_file" 2>/dev/null || echo "")
             
             if [[ -z "$has_glm_model" ]]; then
                 log "Adding GLM model to Factory configuration..."
-                # Add GLM model to existing config
                 jq --arg api_key "$ZAI_API_KEY" '.custom_models += [{
                     "model_display_name": "GLM 4.6 Coding Plan",
                     "model": "glm-4.6",
@@ -538,10 +535,10 @@ EOF
 
 # Setup workspace
 setup_workspace() {
-    # Run as the real user, not root
     if [[ "$SYSTEM_INSTALL" == true ]]; then
-        sudo -u "$REAL_USER" bash -c "
+        sudo -u "$REAL_USER" bash -c "$(declare -f log warn error);
             export HOME=\"$REAL_HOME\"
+            log \"Checking workspace for user $REAL_USER...\"
             if [[ ! -d \"$REAL_HOME/code\" ]]; then
                 log \"Creating workspace directory...\"
                 mkdir -p \"$REAL_HOME/code\"
@@ -551,7 +548,6 @@ setup_workspace() {
         "
     else
         log "Checking workspace setup..."
-        
         if [[ ! -d ~/code ]]; then
             log "Creating workspace directory..."
             mkdir -p ~/code
@@ -574,7 +570,7 @@ main() {
     configure_factory
     setup_workspace
     
-    log "Setup complete! Run 'source ~/.bashrc' to reload environment."
+    log "Setup complete! Run 'source ~/.bashrc' to apply changes to your current shell."
     log "Workspace ready at ~/code"
     log "Use 'gh-switch <num>' to switch GitHub accounts"
     log "Use 'gh-list' to see available accounts"
