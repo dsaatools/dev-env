@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
+# Fail on any error, unbound variable, or pipe failure
 set -euo pipefail
 
-# --- Configuration & Globals ---
+# --- Configuration ---
 # Colors for cleaner output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -9,331 +10,246 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# Globals for step tracking and error handling
-STEP_COUNTER=0
-TOTAL_STEPS=8 # Total number of major steps in main()
-CURRENT_STEP_DESC=""
-SCRIPT_COMPLETE=false
-
-# --- Core Infrastructure: Logging & Error Handling ---
-
-# Trap to catch any script exit, successful or not
-# If the exit is an error, it reports the last running step.
-cleanup() {
-    # $? is the exit code of the last command.
-    if [[ $? -ne 0 && "$SCRIPT_COMPLETE" == false ]]; then
-        error "Script failed on Step $STEP_COUNTER/$TOTAL_STEPS: $CURRENT_STEP_DESC"
-        echo -e "${RED}Please check the output above for the specific error message.${NC}"
-    fi
-}
-trap cleanup EXIT
-
-# Primary log function
-log() { echo -e "${GREEN}[$(date +'%H:%M:%S')]${NC} $*"; }
+# --- Logging and Error Handling ---
+log() { echo -e "${CYAN}[$(date +'%H:%M:%S')]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
-# Wrapper to run functions as formal, numbered steps
-run_step() {
-    STEP_COUNTER=$((STEP_COUNTER + 1))
-    local func_name=$1
-    CURRENT_STEP_DESC=$2
-    
-    echo -e "\n${CYAN}--- Step $STEP_COUNTER/$TOTAL_STEPS: $CURRENT_STEP_DESC ---${NC}"
-    # Execute the function passed as an argument
-    "$func_name"
-    log "✓ Step $STEP_COUNTER/$TOTAL_STEPS: $CURRENT_STEP_DESC complete."
-}
-
+# Trap to catch errors and exit gracefully
+SCRIPT_COMPLETED=false
+trap '[[ "$SCRIPT_COMPLETED" == false ]] && error "Script exited prematurely on line $LINENO."' ERR
 
 # --- Script Initialization ---
-init() {
-    log "Initializing setup..."
-    # Determine if running as root and identify the real user
-    if [[ $EUID -eq 0 ]]; then
-        log "Running with sudo. System-wide changes will be applied."
-        SYSTEM_INSTALL=true
-        # Ensure SUDO_USER is set; otherwise, the script can't target the user's home dir.
-        REAL_USER=${SUDO_USER:?"Script must be run with 'sudo', not directly as the root user."}
-        REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
-    else
-        log "Running as user '$USER'. System package installation will be skipped."
-        SYSTEM_INSTALL=false
-        REAL_USER=$USER
-        REAL_HOME=$HOME
-    fi
+log "Initializing script..."
+# Ensure script is run with sudo for package management
+if [[ $EUID -ne 0 ]] || [[ -z "${SUDO_USER:-}" ]]; then
+    error "This script must be run with sudo (e.g., 'sudo bash -c \"...\"')."
+fi
 
-    # Define Bun's location and update PATH for the *current script execution*
-    # This is critical for subsequent commands to find executables installed in this script.
-    BUN_INSTALL="$REAL_HOME/.bun"
-    export PATH="$BUN_INSTALL/bin:$REAL_HOME/.local/bin:$PATH"
-}
+REAL_USER=$SUDO_USER
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+log "Running as root on behalf of user: ${GREEN}$REAL_USER${NC} (home: $REAL_HOME)"
 
+# Define key paths and export them for the script's context
+export BUN_INSTALL="$REAL_HOME/.bun"
+export FACTORY_INSTALL="$REAL_HOME/.local"
+export PATH="$BUN_INSTALL/bin:$FACTORY_INSTALL/bin:$PATH"
 
-# --- Setup Functions ---
+# --- Functions ---
 
-# Check for required environment variables from the .env file
 check_env() {
+    log "--- Starting: Environment Check ---"
     local required=("GITHUB_TOKEN" "FACTORY_API_KEY" "ZAI_API_KEY" "GIT_USER_NAME" "GIT_USER_EMAIL")
     for var in "${required[@]}"; do
         [[ -z "${!var:-}" ]] && error "$var is required. Set it in .env or export before running."
     done
-
-    if [[ -n "${GITHUB_TOKENS:-}" ]]; then
-        IFS=',' read -ra TOKENS <<< "$GITHUB_TOKENS"
-        log "Found ${#TOKENS[@]} additional GitHub tokens."
-    fi
+    log "All required environment variables are present."
+    log "--- Finished: Environment Check ---"
 }
 
-# Install or verify system packages (requires root)
 install_packages() {
-    if [[ "$SYSTEM_INSTALL" != true ]]; then
-        log "Not running as root, skipping system package installation."
-        return
-    fi
-
+    log "--- Starting: System Package Installation ---"
     export DEBIAN_FRONTEND=noninteractive
     log "Updating package lists..."
     apt-get update -qq
 
     local packages=("curl" "unzip" "htop" "tmux" "nodejs" "git" "jq")
-    for package in "${packages[@]}"; do
-        if ! dpkg -l | grep -q "^ii  $package "; then
-            log "Installing $package..."
-            apt-get install -y "$package"
+    for pkg in "${packages[@]}"; do
+        if ! dpkg -l | grep -q "^ii  $pkg "; then
+            log "Installing $pkg..."
+            apt-get install -y "$pkg"
         else
-            log "$package is already installed."
+            log "$pkg is already installed."
         fi
     done
+    log "--- Finished: System Package Installation ---"
 }
 
-# Install Bun JS runtime for the correct user
+setup_git() {
+    log "--- Starting: Git Configuration ---"
+    sudo -u "$REAL_USER" bash -c "
+        set -euo pipefail
+        git config --global user.name '$GIT_USER_NAME'
+        git config --global user.email '$GIT_USER_EMAIL'
+        git config --global init.defaultBranch main
+    " || error "Failed to configure Git."
+    log "Git configured globally for user '$GIT_USER_NAME'."
+    log "--- Finished: Git Configuration ---"
+}
+
 install_bun() {
-    local install_logic='
-        set -e # <-- Ensure subshell exits on error
-        log "Checking Bun installation for user $REAL_USER..."
-        if ! command -v bun &> /dev/null; then
-            log "Installing Bun..."
+    log "--- Starting: Bun Installation ---"
+    local bun_logic='
+        set -euo pipefail
+        if ! command -v bun &>/dev/null; then
+            echo "Installing Bun JS runtime..."
             curl -fsSL https://bun.sh/install | bash
             
-            # Add to shell profile for *future* sessions
-            if ! grep -q "BUN_INSTALL" "$REAL_HOME/.bashrc"; then
-                echo "" >> "$REAL_HOME/.bashrc"
-                echo "# Bun JS Runtime" >> "$REAL_HOME/.bashrc"
-                echo "export BUN_INSTALL=\"\$HOME/.bun\"" >> "$REAL_HOME/.bashrc"
-                echo "export PATH=\"\$BUN_INSTALL/bin:\$PATH\"" >> "$REAL_HOME/.bashrc"
-                log "Added bun to .bashrc"
+            # Add to shell profile for future sessions
+            if ! grep -q "BUN_INSTALL" "$HOME/.bashrc"; then
+                echo "" >> "$HOME/.bashrc"
+                echo "# Bun JS Runtime" >> "$HOME/.bashrc"
+                echo "export BUN_INSTALL=\"\$HOME/.bun\"" >> "$HOME/.bashrc"
+                echo "export PATH=\"\$BUN_INSTALL/bin:\$PATH\"" >> "$HOME/.bashrc"
+                echo "Bun environment variables added to ~/.bashrc"
             fi
         else
-            log "Bun is already installed (version: $(bun --version))"
+            echo "Bun is already installed (version: $(bun --version))."
         fi
     '
-    sudo -u "$REAL_USER" bash -c "$(declare -f log); export HOME=\"$REAL_HOME\" PATH=\"$PATH\" REAL_USER=\"$REAL_USER\" REAL_HOME=\"$REAL_HOME\"; $install_logic"
+    sudo -u "$REAL_USER" HOME="$REAL_HOME" bash -c "$bun_logic" || error "Bun installation failed."
+    log "--- Finished: Bun Installation ---"
 }
 
-# Install Claude Code CLI globally using Bun
 install_claude() {
-    local install_logic='
-        set -e # <-- Ensure subshell exits on error
-        log "Checking claude-code installation..."
+    log "--- Starting: Claude Code CLI Installation ---"
+    local claude_logic='
+        set -euo pipefail
+        export PATH="$HOME/.bun/bin:$PATH"
         if ! bun pm ls -g | grep -q "@anthropic-ai/claude-code"; then
-            log "Installing @anthropic-ai/claude-code..."
+            echo "Installing @anthropic-ai/claude-code globally..."
             bun install -g @anthropic-ai/claude-code
         else
-            log "claude-code is already installed."
+            echo "Claude Code CLI is already installed."
         fi
     '
-    sudo -u "$REAL_USER" bash -c "$(declare -f log); export HOME=\"$REAL_HOME\" PATH=\"$PATH\"; $install_logic"
+    sudo -u "$REAL_USER" HOME="$REAL_HOME" bash -c "$claude_logic" || error "Claude Code CLI installation failed."
+    log "--- Finished: Claude Code CLI Installation ---"
 }
 
-# Configure Git with user details from env vars
-setup_git() {
-    local setup_logic='
-        set -e # <-- Ensure subshell exits on error
-        log "Configuring Git for user $GIT_USER_NAME..."
-        git config --global user.name "$GIT_USER_NAME"
-        git config --global user.email "$GIT_USER_EMAIL"
-        git config --global init.defaultBranch main
-        git config --global pull.rebase false
-    '
-    sudo -u "$REAL_USER" bash -c "$(declare -f log); export HOME=\"$REAL_HOME\" GIT_USER_NAME=\"$GIT_USER_NAME\" GIT_USER_EMAIL=\"$GIT_USER_EMAIL\"; $setup_logic"
-}
-
-# Install and configure GitHub CLI
 setup_gh() {
-    # Install the 'gh' package if needed (requires root)
-    if [[ "$SYSTEM_INSTALL" == true ]]; then
-        if ! command -v gh &> /dev/null; then
-            log "Installing GitHub CLI..."
-            (
-                export DEBIAN_FRONTEND=noninteractive
-                curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-                chmod 644 /usr/share/keyrings/githubcli-archive-keyring.gpg
-                echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
-                apt-get update -qq
-                apt-get install -y gh
-            ) || error "Failed to install GitHub CLI"
-        else
-            log "GitHub CLI is already installed."
-        fi
-    fi
-
-    # Configure GH auth and add helpers for the real user
-    local configure_logic='
-        set -e # <-- Ensure subshell exits on error
-        log "Configuring GitHub CLI for user $REAL_USER..."
-        
-        # Authenticate with primary token
-        echo "$GITHUB_TOKEN" | gh auth login --with-token --hostname github.com
-        gh auth setup-git
-        gh config set git_protocol https
-        log "GitHub CLI authenticated with primary token."
-
-        # Define the functions to be added to .bashrc. Using a non-expanding heredoc.
-        local BASHRC_FUNCTIONS
-        read -r -d "" BASHRC_FUNCTIONS << "EOF"
-# GitHub account switcher
-gh-switch() {
-    local account_num=${1:-1}
-    if [[ $account_num -eq 1 ]]; then
-        [[ -z "${GITHUB_TOKEN:-}" ]] && { echo "Error: GITHUB_TOKEN is not set." >&2; return 1; }
-        echo "$GITHUB_TOKEN" | gh auth login --with-token --hostname github.com
-        echo "Switched to primary GitHub account."
-    elif [[ -f "$HOME/.config/gh/tokens/token_$account_num" ]]; then
-        token=$(cat "$HOME/.config/gh/tokens/token_$account_num")
-        echo "$token" | gh auth login --with-token --hostname github.com
-        echo "Switched to GitHub account #$account_num."
+    log "--- Starting: GitHub CLI Setup ---"
+    # 1. Install package if needed
+    if ! command -v gh &>/dev/null; then
+        log "Installing GitHub CLI package..."
+        (
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            chmod 644 /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+            apt-get update -qq
+            apt-get install -y gh
+        ) || error "Failed to install GitHub CLI package."
     else
-        echo "Token for account #$account_num not found." >&2; return 1;
+        log "GitHub CLI is already installed."
     fi
-}
 
-gh-list() {
-    echo "Available GitHub accounts:"
-    echo "1: Primary (from GITHUB_TOKEN)"
-    for token_file in "$HOME"/.config/gh/tokens/token_*; do
-        if [[ -f "$token_file" ]]; then
-            num=$(basename "$token_file" | cut -d"_" -f2)
-            echo "$num: Additional token"
-        fi
-    done | sort -n
-}
-EOF
+    # 2. Authenticate and configure for the user
+    local gh_logic='
+        set -euo pipefail
+        echo "Authenticating GitHub CLI..."
+        # Use primary token for login
+        echo "$GITHUB_TOKEN" | gh auth login --with-token --hostname github.com
+        gh config set git_protocol https
+        echo "GitHub CLI authenticated successfully."
 
         # Store additional tokens if they exist
-        if [[ -n "${GITHUB_TOKENS:-}" ]]; then
-            mkdir -p "$REAL_HOME/.config/gh/tokens"
+        if [[ -n "$GITHUB_TOKENS" ]]; then
+            mkdir -p "$HOME/.config/gh/tokens"
             IFS="," read -ra TOKENS <<< "$GITHUB_TOKENS"
             for i in "${!TOKENS[@]}"; do
-                token_file="$REAL_HOME/.config/gh/tokens/token_$((i+2))"
+                local token_file="$HOME/.config/gh/tokens/token_$((i+2))"
                 echo "${TOKENS[$i]}" > "$token_file"
                 chmod 600 "$token_file"
-                log "Stored additional GitHub token for account #$((i+2))"
+                echo "Stored additional GitHub token $((i+2))."
             done
         fi
-
-        # Add helper functions to .bashrc if not already present
-        if ! grep -q "# GitHub account switcher" "$REAL_HOME/.bashrc"; then
-            echo "" >> "$REAL_HOME/.bashrc"
-            # Using printf to safely add the functions block
-            printf "%s\n" "$BASHRC_FUNCTIONS" >> "$REAL_HOME/.bashrc"
-            log "Added GitHub account switcher functions to .bashrc."
-        else
-            log "GitHub switcher functions already in .bashrc."
-        fi
     '
-    sudo -u "$REAL_USER" bash -c "$(declare -f log); export HOME=\"$REAL_HOME\" GITHUB_TOKEN=\"$GITHUB_TOKEN\" GITHUB_TOKENS=\"$GITHUB_TOKENS\" REAL_HOME=\"$REAL_HOME\"; $configure_logic"
+    sudo -u "$REAL_USER" HOME="$REAL_HOME" GITHUB_TOKEN="$GITHUB_TOKEN" GITHUB_TOKENS="${GITHUB_TOKENS:-}" bash -c "$gh_logic" || error "GitHub CLI authentication failed."
+    log "--- Finished: GitHub CLI Setup ---"
 }
 
-# Install and configure Factory CLI
 install_factory() {
-    local install_logic='
-        set -e # <-- Ensure subshell exits on error
-        log "Checking Factory CLI..."
-        if ! command -v factory &> /dev/null; then
-            log "Installing Factory CLI..."
+    log "--- Starting: Factory CLI Installation ---"
+    local factory_logic='
+        set -euo pipefail
+        if ! command -v factory &>/dev/null; then
+            echo "Installing Factory CLI..."
             curl -fsSL https://app.factory.ai/cli | sh
-            # Ensure .local/bin is in the PATH for future sessions
-            if ! grep -q ".local/bin" "$REAL_HOME/.bashrc"; then
-                echo "" >> "$REAL_HOME/.bashrc"
-                echo "# Add local binaries to PATH for Factory CLI" >> "$REAL_HOME/.bashrc"
-                echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> "$REAL_HOME/.bashrc"
+            
+            if ! grep -q ".local/bin" "$HOME/.bashrc"; then
+                echo "" >> "$HOME/.bashrc"
+                echo "# Factory CLI Path" >> "$HOME/.bashrc"
+                echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> "$HOME/.bashrc"
+                echo "Factory CLI path added to ~/.bashrc"
             fi
         else
-            log "Factory CLI is already installed."
+            echo "Factory CLI is already installed."
         fi
     '
-    sudo -u "$REAL_USER" bash -c "$(declare -f log); export HOME=\"$REAL_HOME\" PATH=\"$PATH\" REAL_HOME=\"$REAL_HOME\"; $install_logic"
+    sudo -u "$REAL_USER" HOME="$REAL_HOME" bash -c "$factory_logic" || error "Factory CLI installation failed."
+    log "--- Finished: Factory CLI Installation ---"
 }
 
 configure_factory() {
-    local configure_logic='
-        set -e # <-- Ensure subshell exits on error
-        log "Configuring Factory CLI..."
-        local config_dir="$REAL_HOME/.factory"
+    log "--- Starting: Factory CLI Configuration ---"
+    local factory_config_logic='
+        set -euo pipefail
+        local config_dir="$HOME/.factory"
         local config_file="$config_dir/config.json"
         mkdir -p "$config_dir"
-
-        # Using jq to build the JSON configuration cleanly
+        
+        echo "Writing Factory config to $config_file..."
+        # Use jq to safely build the JSON config
         jq -n \
-          --arg factory_api_key "$FACTORY_API_KEY" \
-          --arg zai_api_key "$ZAI_API_KEY" \
-          "{
-            api_key: \$factory_api_key,
-            custom_models: [
+          --arg factory_key "$FACTORY_API_KEY" \
+          --arg zai_key "$ZAI_API_KEY" \
+          '{
+            "api_key": $factory_key,
+            "custom_models": [
               {
-                model_display_name: \"GLM 4.6 Coding Plan\",
-                model: \"glm-4.6\",
-                base_url: \"https://api.z.ai/api/anthropic\",
-                api_key: \$zai_api_key,
-                provider: \"zai\"
+                "model_display_name": "GLM 4.6 Coding Plan",
+                "model": "glm-4.6",
+                "base_url": "https://api.z.ai/api/anthropic",
+                "api_key": $zai_key,
+                "provider": "zai"
               }
             ]
-          }" > "$config_file"
-          
-        log "Factory config file created/updated at $config_file."
+          }' > "$config_file"
+        echo "Factory config file created/updated."
     '
-    sudo -u "$REAL_USER" bash -c "$(declare -f log); export HOME=\"$REAL_HOME\" FACTORY_API_KEY=\"$FACTORY_API_KEY\" ZAI_API_KEY=\"$ZAI_API_KEY\" REAL_HOME=\"$REAL_HOME\"; $configure_logic"
+    sudo -u "$REAL_USER" HOME="$REAL_HOME" FACTORY_API_KEY="$FACTORY_API_KEY" ZAI_API_KEY="$ZAI_API_KEY" bash -c "$factory_config_logic" || error "Factory CLI configuration failed."
+    log "--- Finished: Factory CLI Configuration ---"
 }
 
-# Create a standard workspace directory
 setup_workspace() {
-    local setup_logic='
-        set -e # <-- Ensure subshell exits on error
-        if [[ ! -d "$REAL_HOME/code" ]]; then
-            mkdir -p "$REAL_HOME/code"
-            log "Created ~/code directory."
+    log "--- Starting: Workspace Setup ---"
+    local workspace_logic='
+        set -euo pipefail
+        local code_dir="$HOME/code"
+        if [[ ! -d "$code_dir" ]]; then
+            mkdir -p "$code_dir"
+            echo "Created workspace directory at ~/code."
         else
-            log "~/code directory already exists."
+            echo "Workspace directory ~/code already exists."
         fi
     '
-    sudo -u "$REAL_USER" bash -c "$(declare -f log); export REAL_HOME=\"$REAL_HOME\"; $setup_logic"
+    sudo -u "$REAL_USER" HOME="$REAL_HOME" bash -c "$workspace_logic" || error "Workspace setup failed."
+    log "--- Finished: Workspace Setup ---"
 }
-
 
 # --- Main Execution ---
 main() {
-    init
+    log "${GREEN}Starting Full Dev Environment Setup for user $REAL_USER...${NC}"
     
-    run_step check_env "Checking environment variables"
-    run_step install_packages "Installing system packages"
-    run_step setup_git "Configuring Git"
-    run_step install_bun "Installing Bun.js runtime"
-    run_step install_claude "Installing Claude Code CLI"
-    run_step setup_gh "Installing & Configuring GitHub CLI"
-    run_step install_factory "Installing Factory CLI"
-    run_step configure_factory "Configuring Factory CLI"
-    run_step setup_workspace "Creating workspace directory"
+    check_env
+    install_packages
+    setup_git
+    install_bun
+    install_claude
+    setup_gh
+    install_factory
+    configure_factory
+    setup_workspace
 
-    SCRIPT_COMPLETE=true # Signal that the script has finished successfully
-
-    echo -e "\n${GREEN}=====================================${NC}"
-    echo -e "${GREEN}  Dev Environment Setup Complete!  ${NC}"
-    echo -e "${GREEN}=====================================${NC}"
-    log "Run ${CYAN}'source ~/.bashrc'${NC} or start a new shell to apply all changes."
-    log "Your workspace is ready at: ${CYAN}$REAL_HOME/code${NC}"
-    log "Use ${CYAN}'gh-list'${NC} and ${CYAN}'gh-switch <num>'${NC} to manage GitHub accounts."
+    # Set completion flag to prevent error trap on successful exit
+    SCRIPT_COMPLETED=true
+    
+    log "${GREEN}===============================================${NC}"
+    log "${GREEN}          SETUP COMPLETE! 🎉          ${NC}"
+    log "${GREEN}===============================================${NC}"
+    log "To apply all changes, please start a new shell or run:"
+    log "${YELLOW}source $REAL_HOME/.bashrc${NC}"
 }
 
-# Run the main function with all script arguments
-main "$@"
+# Run the main function
+main
