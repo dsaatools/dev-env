@@ -13,10 +13,16 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 # Check required env vars
 check_env() {
-    local required=("GITHUB_TOKEN" "FACTORY_API_KEY" "ZAI_API_KEY")
+    local required=("GITHUB_TOKEN" "FACTORY_API_KEY" "ZAI_API_KEY" "GIT_USER_NAME" "GIT_USER_EMAIL")
     for var in "${required[@]}"; do
         [[ -z "${!var:-}" ]] && error "$var is required. Set it in .env or export before running."
     done
+    
+    # Optional multiple tokens
+    if [[ -n "${GITHUB_TOKENS:-}" ]]; then
+        IFS=',' read -ra TOKENS <<< "$GITHUB_TOKENS"
+        log "Found ${#TOKENS[@]} additional GitHub tokens"
+    fi
 }
 
 # Install system packages
@@ -47,7 +53,17 @@ install_claude() {
     bun install -g @anthropic-ai/claude-code
 }
 
-# Setup GitHub CLI
+# Setup git config
+setup_git() {
+    log "Configuring git..."
+    git config --global user.name "$GIT_USER_NAME"
+    git config --global user.email "$GIT_USER_EMAIL"
+    git config --global init.defaultBranch main
+    git config --global pull.rebase false
+    log "Git configured for $GIT_USER_NAME <$GIT_USER_EMAIL>"
+}
+
+# Setup GitHub CLI with multiple accounts
 setup_gh() {
     log "Setting up GitHub CLI..."
     if ! command -v gh &> /dev/null; then
@@ -57,9 +73,54 @@ setup_gh() {
         apt-get install -y gh
     fi
     
-    # Non-interactive auth
-    echo "$GITHUB_TOKEN" | gh auth login --with-token
+    # Primary account
+    echo "$GITHUB_TOKEN" | gh auth login --with-token --hostname github.com
     gh config set git_protocol https
+    
+    # Store additional tokens for later use
+    if [[ -n "${GITHUB_TOKENS:-}" ]]; then
+        mkdir -p ~/.config/gh/tokens
+        IFS=',' read -ra TOKENS <<< "$GITHUB_TOKENS"
+        for i in "${!TOKENS[@]}"; do
+            local token="${TOKENS[$i]}"
+            local token_file="$HOME/.config/gh/tokens/token_$((i+2))"
+            echo "$token" > "$token_file"
+            chmod 600 "$token_file"
+            log "Stored additional GitHub token $((i+2))"
+        done
+        
+        # Create helper function to switch accounts
+        cat >> ~/.bashrc << 'EOF'
+
+# GitHub account switcher
+gh-switch() {
+    local account_num=${1:-1}
+    if [[ $account_num -eq 1 ]]; then
+        echo "$GITHUB_TOKEN" | gh auth login --with-token --hostname github.com
+        echo "Switched to primary GitHub account"
+    elif [[ -f "$HOME/.config/gh/tokens/token_$account_num" ]]; then
+        local token=$(cat "$HOME/.config/gh/tokens/token_$account_num")
+        echo "$token" | gh auth login --with-token --hostname github.com
+        echo "Switched to GitHub account $account_num"
+    else
+        echo "Token for account $account_num not found"
+        return 1
+    fi
+}
+
+# List available GitHub accounts
+gh-list() {
+    echo "Available GitHub accounts:"
+    echo "1: Primary"
+    for token_file in "$HOME"/.config/gh/tokens/token_*; do
+        if [[ -f "$token_file" ]]; then
+            local num=$(basename "$token_file" | cut -d'_' -f2)
+            echo "$num: Additional"
+        fi
+    done
+}
+EOF
+    fi
 }
 
 # Install Factory CLI
@@ -103,6 +164,7 @@ main() {
     log "Starting dev environment setup..."
     check_env
     install_packages
+    setup_git
     install_bun
     install_claude
     setup_gh
@@ -112,6 +174,8 @@ main() {
     
     log "Setup complete! Run 'source ~/.bashrc' to reload environment."
     log "Workspace ready at ~/code"
+    log "Use 'gh-switch <num>' to switch GitHub accounts"
+    log "Use 'gh-list' to see available accounts"
 }
 
 main "$@"
