@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- Dead Man's Switch ---
+# If the script exits for any reason before the end, this trap will fire.
+SCRIPT_COMPLETED=false
+finish() {
+  if [[ "$SCRIPT_COMPLETED" != "true" ]]; then
+    # Adds a newline to separate from any previous output for clarity.
+    echo
+    error "Script exited prematurely. Check the log for the last successful step."
+  fi
+}
+trap finish EXIT
+
+# --- Configuration ---
+# Colors
+}
+trap finish EXIT
+
 # --- Configuration ---
 # Colors for cleaner output
 RED='\033[0;31m'
@@ -18,7 +35,7 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 if [[ $EUID -eq 0 ]]; then
     log "Running as root for system package installation"
     SYSTEM_INSTALL=true
-    # Ensure SUDO_USER is set; otherwise, fall back to USER, though less ideal.
+    # Ensure SUDO_USER is set; otherwise, fall back to USER, which is a bad sign.
     REAL_USER=${SUDO_USER:?"Script must be run with sudo, not as root directly."}
     REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 else
@@ -106,15 +123,13 @@ install_bun() {
 
 # Install Claude Code CLI globally using Bun
 install_claude() {
-    # This logic is specifically hardened to prevent `set -e` from exiting the script
-    # if `bun pm ls` returns a non-zero exit code.
     local install_logic='
         log "Checking claude-code installation..."
-        if bun pm ls -g 2>/dev/null | grep -q "@anthropic-ai/claude-code"; then
-            log "claude-code is already installed."
-        else
-            log "claude-code not found. Installing..."
+        if ! bun pm ls -g | grep -q "@anthropic-ai/claude-code"; then
+            log "Installing claude-code..."
             bun install -g @anthropic-ai/claude-code
+        else
+            log "claude-code is already installed."
         fi
     '
 
@@ -125,7 +140,6 @@ install_claude() {
         $install_logic
     "
 }
-
 
 # Configure Git with user details from env vars
 setup_git() {
@@ -209,10 +223,13 @@ EOF
     # Configure GH auth and add helpers for the real user
     local configure_logic='
         log "Configuring GitHub CLI for user $REAL_USER..."
-        # Always attempt to log in to ensure the token is fresh
-        log "Authenticating with primary GitHub account..."
-        echo "$GITHUB_TOKEN" | gh auth login --with-token --hostname github.com
-        gh config set git_protocol https
+        if ! gh auth status &> /dev/null; then
+            log "Authenticating with primary GitHub account..."
+            echo "$GITHUB_TOKEN" | gh auth login --with-token --hostname github.com
+            gh config set git_protocol https
+        else
+            log "GitHub CLI already authenticated."
+        fi
 
         if [[ -n "${GITHUB_TOKENS:-}" ]]; then
             mkdir -p "$REAL_HOME/.config/gh/tokens"
@@ -220,9 +237,11 @@ EOF
             for i in "${!TOKENS[@]}"; do
                 local token="${TOKENS[$i]}"
                 local token_file="$REAL_HOME/.config/gh/tokens/token_$((i+2))"
-                echo "$token" > "$token_file"
-                chmod 600 "$token_file"
-                log "Stored additional GitHub token $((i+2))"
+                if [[ ! -f "$token_file" ]]; then
+                    echo "$token" > "$token_file"
+                    chmod 600 "$token_file"
+                    log "Stored additional GitHub token $((i+2))"
+                fi
             done
 
             if ! grep -q "# GitHub account switcher" "$REAL_HOME/.bashrc"; then
@@ -243,10 +262,11 @@ EOF
     "
 }
 
+
 # Install and configure Factory CLI
 install_factory() {
     export PATH="$REAL_HOME/.local/bin:$PATH"
-
+    
     local install_logic='
         log "Checking Factory CLI..."
         if ! command -v factory &> /dev/null; then
@@ -261,7 +281,7 @@ install_factory() {
             log "Factory CLI already installed."
         fi
     '
-
+    
     sudo -u "$REAL_USER" bash -c "$(declare -f log);
         export HOME=\"$REAL_HOME\"
         export PATH=\"$REAL_HOME/.local/bin:\$PATH\"
@@ -276,9 +296,9 @@ configure_factory() {
         local config_file="$config_dir/config.json"
         mkdir -p "$config_dir"
 
-        log "Writing Factory config file..."
-        # Overwrite config file each time to ensure it matches the .env variables
-        cat > "$config_file" << EOF
+        if [[ ! -f "$config_file" ]]; then
+            log "Creating new Factory config file..."
+            cat > "$config_file" << EOF
 {
   "api_key": "$FACTORY_API_KEY",
   "custom_models": [
@@ -292,9 +312,15 @@ configure_factory() {
   ]
 }
 EOF
-        log "Factory config written to $config_file."
+        else
+            log "Factory config file already exists. Verifying settings..."
+            # Simple verification for now. Can be expanded to update keys.
+            if ! jq -e ".api_key == \"$FACTORY_API_KEY\"" "$config_file" >/dev/null; then
+                 warn "Factory API key in config does not match .env. Manual check recommended."
+            fi
+        fi
     '
-
+    
     sudo -u "$REAL_USER" bash -c "$(declare -f log warn);
         export HOME=\"$REAL_HOME\"
         export FACTORY_API_KEY=\"$FACTORY_API_KEY\"
@@ -315,7 +341,7 @@ setup_workspace() {
             log "~/code directory already exists."
         fi
     '
-
+    
     sudo -u "$REAL_USER" bash -c "$(declare -f log);
         REAL_HOME=\"$REAL_HOME\"
         $setup_logic
@@ -339,6 +365,9 @@ main() {
     log "Run 'source ~/.bashrc' or start a new shell to apply changes."
     log "Workspace ready at: $REAL_HOME/code"
     log "Use 'gh-switch <num>' and 'gh-list' to manage GitHub accounts."
+
+    # Disarm the trap now that we've reached the end successfully.
+    SCRIPT_COMPLETED=true
 }
 
 # Run the main function with all script arguments
