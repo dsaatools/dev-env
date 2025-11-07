@@ -44,3 +44,29 @@ Tip: you can generate a Personal Access Token here https://github.com/settings/t
 The minimum required scopes are 'repo', 'read:org', 'workflow'.
 ? Paste your authentication token:
 *******
+
+Tip: you can generate a Personal Access Token here https://github.com/settings/tokens
+The minimum required scopes are 'repo', 'read:org', 'workflow'.
+? Paste your authentication token: **********************************- gh config set -h github.com git_protocol https
+✓ Configured git protocol
+! Authentication credentials saved in plain text
+✓ Logged in as dsaatools
+root@dsaa:/home/dsaa# curl -fsSL https://app.factory.ai/cli | sh
+Downloading Factory CLI v0.22.12 for linux-x64
+Fetching and verifying checksum
+Checksum verification passed
+Downloading ripgrep for linux-x64
+Fetching and verifying ripgrep checksum
+Ripgrep checksum verification passed
+Factory CLI v0.22.12 installed successfully to /root/.local/bin/droid
+Ripgrep installed successfully to /root/.factory/bin/rg
+Checking PATH configuration...
+PATH configuration required
+Add /root/.local/bin to your PATH:
+  echo 'export PATH=/root/.local/bin:$PATH' >> ~/.bashrc
+  source ~/.bashrc
+Then run 'droid' to get started!
+root@dsaa:/home/dsaa# echo 'export PATH=/root/.local/bin:$PATH' >> ~/.bashrc
+  source ~/.bashrc
+root@dsaa:/home/dsaa#
+export FACTORY_API_KEY=******
