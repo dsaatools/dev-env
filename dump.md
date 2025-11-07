@@ -30,3 +30,10 @@ No user sessions are running outdated binaries.
 No VM guests are running outdated hypervisor (qemu) binaries on this
  host.
 root@dsaa:/home/dsaa#
+
+
+install tmux
+curl -fsSL https://bun.sh/install | bash
+source /root/.bashrc
+apt install nodejs
+bun i -g @anthropic-ai/claude-code
