@@ -24,6 +24,15 @@ else
     REAL_HOME=$HOME
 fi
 
+## FIX ##
+# Define Bun's location and update the PATH for the CURRENT script execution.
+# This ensures that subsequent commands (like in install_claude) can find `bun`.
+# This was the source of the 'unbound variable' error, as the PATH was
+# not being correctly set for the script's scope when run as root.
+BUN_INSTALL="$REAL_HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+
+
 # Check required env vars
 check_env() {
     local required=("GITHUB_TOKEN" "FACTORY_API_KEY" "ZAI_API_KEY" "GIT_USER_NAME" "GIT_USER_EMAIL")
@@ -68,48 +77,52 @@ install_packages() {
 
 # Install bun
 install_bun() {
-    # Run as the real user, not root
-    if [[ "$SYSTEM_INSTALL" == true ]]; then
-        sudo -u "$REAL_USER" bash -c "$(declare -f log warn error);
-            export HOME=\"$REAL_HOME\"
-            log \"Installing bun for user $REAL_USER...\"
-            if ! command -v bun &> /dev/null; then
-                curl -fsSL https://bun.sh/install | bash
-                export BUN_INSTALL=\"$REAL_HOME/.bun\"
-                export PATH=\"$BUN_INSTALL/bin:\$PATH\"
+    # This function now focuses on installing bun if it's missing and ensuring
+    # .bashrc is configured for FUTURE sessions. The current session's PATH
+    # is already handled above.
 
-                # Add to bashrc if not already there
-                if ! grep -q 'export BUN_INSTALL=\"$HOME/.bun\"' \"$REAL_HOME/.bashrc\"; then
-                    echo '' >> \"$REAL_HOME/.bashrc\"
-                    echo '# Bun JS Runtime' >> \"$REAL_HOME/.bashrc\"
-                    echo 'export BUN_INSTALL=\"$HOME/.bun\"' >> \"$REAL_HOME/.bashrc\"
-                    echo 'export PATH=\"$BUN_INSTALL/bin:\$PATH\"' >> \"$REAL_HOME/.bashrc\"
-                fi
-            else
-                log \"bun already installed\"
-            fi
-        "
-    else
-        log "Checking bun installation..."
+    # Installation must run as the real user
+    local install_logic='
+        export HOME="$REAL_HOME"
+        export PATH="$BUN_INSTALL/bin:$PATH" # Ensure PATH is set for this subshell
+
+        log "Checking bun installation for user $REAL_USER..."
         if ! command -v bun &> /dev/null; then
             log "Installing bun..."
             curl -fsSL https://bun.sh/install | bash
-            export BUN_INSTALL="$HOME/.bun"
-            export PATH="$BUN_INSTALL/bin:$PATH"
 
-            if ! grep -q 'export BUN_INSTALL="$HOME/.bun"' ~/.bashrc; then
-                echo '' >> ~/.bashrc
-                echo '# Bun JS Runtime' >> ~/.bashrc
-                echo 'export BUN_INSTALL="$HOME/.bun"' >> ~/.bashrc
-                echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> ~/.bashrc
+            # Add to bashrc if not already there for future sessions
+            if ! grep -q "export BUN_INSTALL=\"\$HOME/.bun\"" "$REAL_HOME/.bashrc"; then
+                echo "" >> "$REAL_HOME/.bashrc"
+                echo "# Bun JS Runtime" >> "$REAL_HOME/.bashrc"
+                echo "export BUN_INSTALL=\"\$HOME/.bun\"" >> "$REAL_HOME/.bashrc"
+                echo "export PATH=\"\$BUN_INSTALL/bin:\$PATH\"" >> "$REAL_HOME/.bashrc"
             fi
         else
             local bun_version
             bun_version=$(bun --version)
             log "bun already installed (version $bun_version)"
         fi
+    '
+
+    if [[ "$SYSTEM_INSTALL" == true ]]; then
+        sudo -u "$REAL_USER" bash -c "$(declare -f log warn error);
+            REAL_USER=\"$REAL_USER\"
+            REAL_HOME=\"$REAL_HOME\"
+            BUN_INSTALL=\"$BUN_INSTALL\"
+            $install_logic
+        "
+    else
+        # Directly execute if not root
+        bash -c "$(declare -f log warn error);
+            REAL_USER=\"$REAL_USER\"
+            REAL_HOME=\"$REAL_HOME\"
+            BUN_INSTALL=\"$BUN_INSTALL\"
+            $install_logic
+        "
     fi
 }
+
 
 # Install claude-code
 install_claude() {
